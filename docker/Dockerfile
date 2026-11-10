@@ -1,10 +1,8 @@
 # Base image, one per machine type. The Ubuntu version of the image decides the
 # ROS distro: 24.04 -> jazzy, 22.04 -> humble.
-#   Jetson AGX Thor (L4T r38.4):  stereolabs/zed:5.3.0-py-devel-l4t-r38.4            jazzy
 #   Workstation (RTX GPU):        stereolabs/zed:5.3-gl-devel-cuda12.8-ubuntu24.04   jazzy
 #   JetPack 6 Jetson / ZED Box:   stereolabs/zed:5.3.0-py-devel-l4t-r36.4            humble
 
-# FROM stereolabs/zed:5.3.0-py-devel-l4t-r38.4
 FROM stereolabs/zed:5.3-gl-devel-cuda12.8-ubuntu24.04
 
 ARG ROS_DISTRO=jazzy

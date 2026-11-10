@@ -1,312 +1,91 @@
 # zedx_driver_ros2
 
-This repository provides bringup and fused body tracking for three ZED X cameras. The cameras are attached to a ZED Box, while the primary compute runs on a more powerful networked computer.
+ROS 2 bringup and fused body tracking for ZED X and ZED Mini cameras.
 
-USB cameras such as the ZED Mini are also supported, see [ZED Mini](#zed-mini).
+For ZED X, the cameras connect to a ZED Box while primary compute runs on a networked workstation with an RTX GPU. USB cameras such as the ZED Mini can run directly on a single machine (see [ZED Mini](#zed-mini)).
+
+## Installation
+
+Run the following steps on both the ZED Box and the networked workstation (or on a single machine for ZED Mini):
+
+1. Clone the repository:
+   ```bash
+   git clone --recursive https://github.com/Abanesjo/zedx_driver_ros2
+   ```
+
+2. Configure Zenoh (`src/RMW_ZENOH_ROUTER_CONFIG.json5`):
+   - **ZED Box (or single machine):** leave as is.
+   - **Workstation:** add the ZED Box router IP to `connect.endpoints`, e.g. `endpoints: ["tcp/192.168.0.133:7447"]`.
+
+3. In `docker/Dockerfile`, set `FROM` and `ROS_DISTRO` to match the machine:
+
+   | Machine | `FROM` | `ROS_DISTRO` |
+   |---|---|---|
+   | Workstation with RTX GPU | `stereolabs/zed:5.3-gl-devel-cuda12.8-ubuntu24.04` | `jazzy` |
+   | JetPack 6 Jetson / ZED Box | `stereolabs/zed:5.3.0-py-devel-l4t-r36.4` | `humble` |
+
+   All machines exchanging ROS topics must use the same ROS distro (`rmw_zenoh` does not bridge Humble and Jazzy). The camera stream between `server.launch.xml` and `body_tracking.launch.xml` is not a ROS topic and is unaffected.
+
+4. Build and start the container:
+   ```bash
+   cd docker
+   docker compose up
+   ```
 
 ## Usage
-The instructions assume you will be splitting compute between the ZED Box and a networked workstation computer with an RTX GPU
 
-The default camera-to-stream mapping matches `src/zed_launcher/calibration/zedx/calibration.json`:
+All commands below are run inside the container (`docker exec -it zedx_driver_ros2 bash`).
 
-| Camera | Serial number | Stream port |
-| --- | ---: | ---: |
-| `zed_left` | `41235597` | `30000` |
-| `zed_center` | `46229474` | `30004` |
-| `zed_right` | `49967328` | `30002` |
+### ZED X (ZED Box + Workstation)
 
-The server binds each camera by serial number, so USB device enumeration does not affect this mapping.
+**On the ZED Box:**
 
-`body_tracking.launch.xml` enables three-camera, two-tag fusion by default.
-Front tag ID 0 and back tag ID 1 are both 12 cm `APRILTAG_36h11` markers.
-Each camera first computes a corner-based PnP pose. By default, valid ZED depth
-from the same camera grab is then used to refine that pose; if depth is
-unavailable or fails validation, the PnP pose remains the fallback. Detections
-from the largest agreeing camera set are fused using reprojection quality.
-When the two planar IPPE solutions are within 0.25 pixels of one another, the
-solution closest to that camera/tag pair's recent pose is selected; a clearly
-better reprojection result always wins. This prevents subpixel corner noise
-from alternating between the two planar pose hypotheses.
-With one visible tag, the learned rigid front-to-back transform supplies the
-tag-frame center. With neither visible, the last higher-quality estimate is
-held and rebroadcast.
+1. Start the Zenoh router and leave it running:
+   ```bash
+   ros2 run rmw_zenoh_cpp rmw_zenohd
+   ```
 
-For isolated testing, launch one calibrated camera by its ordered ID
-(`0=left`, `1=center`, `2=right`):
+2. Start the ZED stream server:
+   ```bash
+   ros2 launch zed_launcher server.launch.xml
+   ```
 
-```bash
-ros2 launch zed_launcher body_tracking_single_camera.launch.py \
-  camera_id:=1 stream_address:=192.168.0.135 debug:=true rviz:=true
-```
+**On the Workstation:**
 
-The launch reads the selected serial number from `calibration.json`, while the
-physical camera name and stream port retain the mapping shown above. It still
-publishes the fused skeleton at `/zed_fusion/body_trk/skeletons`, and remaps the
-single combined skeleton/AprilTag image to
-`/zed_fusion/zed_node/rgb/color/rect/body_tracking_overlay`. Per-camera raw
-skeleton topics remain disabled. This one-camera profile uses the SDK's
-quality-oriented `HUMAN_BODY_ACCURATE` detector, `NEURAL` depth, confidence 40,
-and Fusion smoothing 0.1; each remains overrideable with the corresponding
-launch argument. Fusion performs tracking and body fitting once, while the
-camera sender performs detection only.
+1. Start the Zenoh router and leave it running:
+   ```bash
+   ros2 run rmw_zenoh_cpp rmw_zenohd
+   ```
 
-The resulting frame ownership is:
+2. Start body tracking (set `debug:=false` to improve performance):
+   ```bash
+   ros2 launch zed_launcher body_tracking.launch.xml debug:=true rviz:=true
+   ```
+   *(Optional: this can also be run directly on the ZED Box.)*
 
-```text
-pelvis --static--> tag_frame --dynamic--> fusion_world --static--> cameras
-```
-
-The `pelvis -> tag_frame` mounting edge is optional and must be published by
-the robot as a static transform. The AprilTag node publishes only the dynamic
-`tag_frame -> fusion_world` edge. Each camera edge starts from the relative
-pose in `calibration.json`; the ZED SDK supplies the missing live IMU gravity
-rotation before the resulting absolute pose is published to TF.
-Skeletons and colliders remain message data with
-`header.frame_id=fusion_world`; no joint TF tree is generated. The equivalent
-pose topic is `/fusion_world_pose_in_tag_frame`.
-
-Before calibration, tag 1 is seeded as 180 degrees about tag 0's local y axis,
-with each tag's local +z pointing inward toward the initial center estimate
-3 cm away. With `apriltag_learn_tag_transform:=true`, synchronized observations
-of both tags bootstrap their full translation and rotation over 2.5 seconds
-and at least 30 accepted samples. Keep the rigid tag assembly still with both
-tags visible for roughly 2–3 seconds after startup; motion during this window
-can delay calibration or make single-tag estimates less accurate until a
-consistent bootstrap completes. After bootstrap, conservative bounded online
-updates track small mounting changes. The older separation arguments remain
-available as compatibility seed/tuning, but full SE(3) calibration is
-controlled by `apriltag_learn_tag_transform`.
-
-### Depth-assisted AprilTag pose
-
-Depth assistance is enabled by `apriltag_use_depth:=true`. Depth is retrieved
-lazily only for a frame containing a relevant tag detection, and it comes from
-the same ZED SDK grab as that color frame. The implementation samples inside
-the tag border, fits a robust plane, and accepts the result only when all
-configured checks pass:
-
-- Interior sampling excludes a 20% edge margin and requires at least 25 valid
-  samples covering 25% of the sampled pixels.
-- Plane inliers must be within 15 mm and the fitted plane RMSE must be at most
-  10 mm.
-- The depth pose must stay within 20 cm and 20 degrees of PnP, and its implied
-  tag size must be within 25% of the configured physical size.
-
-An accepted depth estimate is blended with the same frame's PnP estimate using
-its plane, coverage, reprojection, size, and PnP-agreement confidence.
-Translation and orientation have independent safety weights. For orientation,
-depth corrects only the tag-plane normal while retaining PnP's in-plane twist;
-this uses stereo depth where it is strongest without importing an unstable
-depth-derived rotation about the normal. Both contributions taper smoothly to
-zero at their safety limits instead of switching poses abruptly. Debug
-overlays report them as `DEPTH T…% R…%`; invalid or insufficient depth reports
-`PNP` and keeps the tag detection.
-
-The corresponding launch arguments are
-`apriltag_depth_inner_margin_ratio`,
-`apriltag_depth_min_valid_samples`,
-`apriltag_depth_min_valid_fraction`,
-`apriltag_depth_plane_inlier_threshold_m`,
-`apriltag_depth_plane_max_rmse_m`,
-`apriltag_depth_max_pnp_translation_delta_m`,
-`apriltag_depth_max_pnp_rotation_delta_deg`, and
-`apriltag_depth_max_size_error_fraction`. IPPE continuity is tuned with
-`apriltag_pnp_ambiguity_reprojection_margin_px` and
-`apriltag_pnp_prior_max_age_sec`. Setting
-`apriltag_use_depth:=false` restores PnP-only estimation.
-
-Full-transform calibration is tuned with
-`apriltag_tag_transform_bootstrap_duration_sec` (2.5 s),
-`apriltag_tag_transform_bootstrap_min_samples` (30),
-`apriltag_tag_transform_pair_max_age_sec` (0.10 s),
-`apriltag_tag_transform_bootstrap_translation_outlier_m` (0.03 m),
-`apriltag_tag_transform_bootstrap_rotation_outlier_deg` (8 degrees),
-`apriltag_tag_transform_online_alpha` (0.01),
-`apriltag_tag_transform_max_translation_step_m` (0.002 m), and
-`apriltag_tag_transform_max_rotation_step_deg` (0.25 degrees). A measured
-front-to-back center baseline can additionally influence orientation through
-`apriltag_tag_pair_baseline_orientation_weight`, but it defaults to zero:
-with the default 6 cm tag spacing, millimetre-scale position noise becomes
-several degrees of angular noise. It is intended only for a substantially
-longer, accurately localized baseline.
-
-### Constrained AprilTag motion filter
-
-The published `tag_frame` pose has three dynamic degrees of freedom:
-fusion-world `x`, `y`, and yaw. Its fusion-world z coordinate is fixed at
-`apriltag_fixed_tag_frame_z_m` (1.0 m by default), and its local +y axis is
-reconstructed to point exactly along `fusion_world` -z; equivalently, its
-rotation is `Rz(yaw) * Rx(-90 degrees)`. Yaw is obtained by projecting each
-fused 6-DoF measurement onto the nearest rotation satisfying that constraint,
-using both horizontal tag axes rather than an Euler-angle decomposition.
-
-Temporal filtering uses a constant-velocity Kalman model for
-`[x, y, yaw, vx, vy, yaw_rate]`; z and z velocity remain constrained.
-Translation and yaw measurements are corrected independently after a
-constant-velocity prediction, with wrapped yaw innovations at +/-180 degrees.
-Cached detections are never applied twice, brief detection loss holds the last
-filtered pose, and a measurement gap over `apriltag_kalman_reset_sec` resets
-velocity before tracking resumes.
-
-Filter tuning is exposed through
-`apriltag_kalman_position_measurement_std_m` (0.010 m),
-`apriltag_kalman_yaw_measurement_std_deg` (1.5 degrees),
-`apriltag_kalman_linear_acceleration_std_mps2` (1.0 m/s^2),
-`apriltag_kalman_yaw_acceleration_std_degps2` (90 degrees/s^2),
-`apriltag_kalman_initial_linear_velocity_std_mps` (1.0 m/s),
-`apriltag_kalman_initial_yaw_rate_std_degps` (90 degrees/s), and
-`apriltag_kalman_reset_sec` (0.5 s).
-
-The default profile uses `HD1080` at 30 FPS, `HUMAN_BODY_FAST`,
-`NEURAL_LIGHT`, full Fusion skeleton smoothing, and a 30 Hz Fusion loop. A
-body is admitted when at least one camera tracks it, allowing the fused
-skeleton to continue through areas seen by only one camera. SDK prediction is
-kept for 0.4 seconds (`body_prediction_timeout_sec`) through brief detection
-loss, while the single-body selector requires 60 frames of consistently
-stronger evidence before switching subjects.
-
-AprilTag detection is limited to 20 Hz and runs independently from camera
-capture with only the newest pending frame retained per camera. This prevents
-tag processing from building latency or delaying the camera grab loop.
-`camera_resolution:=SVGA camera_fps:=60` remains available explicitly, but it
-is not the default three-camera streaming profile.
-
-Fusion health is published once per second on `/zed_fusion/diagnostics`.
-It reports the stream mode and local grab rate, Fusion sender timing and
-camera participation, corrupted frames, fused-message gaps, and per-camera
-AprilTag queue age/processing time/drop counters.
-Set `fusion_diagnostics_rate_hz:=0.0` to disable diagnostics or change the
-value to select a different publication rate.
-
-Generate actual-size print files for the default tags with:
-
-```bash
-ros2 run zed_launcher generate_apriltag_prints --output-dir ./apriltag_prints
-```
-
-This creates one 600-DPI A4 PNG per tag plus a two-page PDF. Print the PDF at
-100% / Actual Size with all fit-to-page scaling disabled, then verify the
-included 10 cm scale.
-
-### ZED Box Setup
-On the ZED Box: 
-1. Clone the repository
-```
-git clone --recursive https://github.com/Abanesjo/zedx_driver_ros2
-```
-2. ROS 2 communication uses `rmw_zenoh`. Leave `src/RMW_ZENOH_ROUTER_CONFIG.json5` as it is on the ZED Box
-3. On the `docker/Dockerfile`, set the base image and ROS distro for the machine (see [Base Image](#base-image)). For a Jetson AGX Thor:
-```
-FROM stereolabs/zed:5.3.0-py-devel-l4t-r38.4
-ARG ROS_DISTRO=jazzy
-```
-4. Create the docker container
-```
-cd docker
-docker compose up
-```
-5. Start the Zenoh router (within the docker container) and leave it running. Nodes cannot discover each other without it
-```
-docker exec -it zedx_driver_ros2 bash
-ros2 run rmw_zenoh_cpp rmw_zenohd
-```
-6. Start the ZED server (within the docker container)
-```
-docker exec -it zedx_driver_ros2 bash
-ros2 launch zed_launcher server.launch.xml
-```
-The default server profile streams all three cameras as HD1080 at a target
-rate of 30 FPS. Restart the remote server after updating this workspace:
-an already-running ZED stream keeps its existing resolution and frame rate,
-and the client cannot renegotiate them.
-7. (Optional) You can run body tracking directly on the ZED Box
-```
-docker exec -it zedx_driver_ros2 bash
-ros2 launch zed_launcher body_tracking.launch.xml debug:=true rviz:=true
-```
-
-Now that the jetson/ZED Box is setup, we now launch on the separate compute.
-### Networked Workstation Setup
-On the Networked Workstation: 
-1. Clone the repository
-```
-git clone --recursive https://github.com/Abanesjo/zedx_driver_ros2
-```
-2. In `src/RMW_ZENOH_ROUTER_CONFIG.json5`, add the ZED Box router to `connect.endpoints` so the two routers find each other, for example `endpoints: ["tcp/192.168.0.133:7447"]`
-3. On the `docker/Dockerfile`, set the base image and ROS distro for the machine (see [Base Image](#base-image)):
-```
-FROM stereolabs/zed:5.3-gl-devel-cuda12.8-ubuntu24.04
-ARG ROS_DISTRO=jazzy
-```
-4. Create the docker container
-```
-cd docker
-docker compose up
-```
-5. Start the Zenoh router (within the docker container) and leave it running
-```
-docker exec -it zedx_driver_ros2 bash
-ros2 run rmw_zenoh_cpp rmw_zenohd
-```
-6. Start the Body Tracking (within the docker container)
-```
-docker exec -it zedx_driver_ros2 bash
-ros2 launch zed_launcher body_tracking.launch.xml debug:=true rviz:=true
-```
-
-Setting `debug:=true` publishes one combined diagnostic image per camera:
-
-```text
-/zed_left/zed_node/rgb/color/rect/body_tracking_overlay
-/zed_center/zed_node/rgb/color/rect/body_tracking_overlay
-/zed_right/zed_node/rgb/color/rect/body_tracking_overlay
-```
-
-Each image contains the camera frame, 2D skeleton, and any detected AprilTag
-outline, ID, and pose axes. The launch no longer publishes raw camera images
-or depth images, nor separate `skeleton_overlay` and `apriltag_overlay` topics.
-Pristine color, lazy same-grab depth, and camera calibration stay in-process,
-so AprilTag pose fusion continues when `debug:=false` without publishing any
-image or depth topics. Disabling debug is recommended for improving
-performance.
-
-7. For the human angle calculation and collision capsules, run:
-```
-docker exec -it zedx_driver_ros2 bash
-ros2 launch human_mapping human_mapping.launch.xml
-```
-
-This launch publishes the tracked G1 upper-body joint commands on
-`/human/joint_commands` and the tracked body/hand capsules on
-`/human/colliders`. It replaces the role of `g1_human_manual.launch.xml` for
-live tracking; do not run both launches at the same time because they publish
-the same topics.
-
-You should see a visualization like below
+3. Start human angle calculation and collision capsules:
+   ```bash
+   ros2 launch human_mapping human_mapping.launch.xml
+   ```
 
 ![rviz](docs/rviz.png)
 
-The axes also show the position of the cameras in the world frame. 
+### ZED Mini
 
-## Base Image
-The `FROM` line and the `ROS_DISTRO` argument at the top of `docker/Dockerfile` must match the machine. The Ubuntu version of the image decides which ROS distro can be installed.
+Two ZED Minis plugged into the same computer do not require a stream server. Start the Zenoh router as above, then run:
 
-| Machine | `FROM` | `ROS_DISTRO` |
-|---|---|---|
-| Jetson AGX Thor (JetPack 7) | `stereolabs/zed:5.3.0-py-devel-l4t-r38.4` | `jazzy` |
-| Workstation with an RTX GPU | `stereolabs/zed:5.3-gl-devel-cuda12.8-ubuntu24.04` | `jazzy` |
-| JetPack 6 Jetson / ZED Box | `stereolabs/zed:5.3.0-py-devel-l4t-r36.4` | `humble` |
-
-All machines that exchange ROS topics must use the same distro: `rmw_zenoh` does not carry messages between Humble and Jazzy. The camera stream between `server.launch.xml` and `body_tracking.launch.xml` is not a ROS topic and is not affected.
-
-## ZED Mini
-Two ZED Minis plugged into the same computer need no stream server: `zed_mini.launch.xml` runs body tracking directly on the local cameras. Start the Zenoh router as above, then:
-```
+```bash
 ros2 launch zed_launcher zed_mini.launch.xml debug:=true rviz:=true
 ```
-It includes `body_tracking.launch.xml` with AprilTag fusion off and defaults to HD720 at 30 fps with a 30 Hz Fusion loop, `depth_mode:=NEURAL_LIGHT`, `body_model:=HUMAN_BODY_MEDIUM`, `body_format:=BODY_18` with body fitting off (with fitting on, Fusion outputs BODY_34), and `single_body_bridge_max_speed_mps:=0`, which holds the last skeleton for up to 0.5 s when Fusion drops the body instead of extrapolating it. VGA at 100 fps gives about 58 Hz but loses the body several times as often; the measurements are in the launch file's header. With BODY_18, `human_mapping` publishes colliders but holds the joint targets at their home pose; pass `body_format:=BODY_38` for joint angles. On a Jetson AGX Thor with one ZED Mini, HD720 only reaches 25 to 45 Hz of fused skeleton. The valid resolution and frame rate combinations are listed at the top of `src/zed_launcher/launch/zed_mini.launch.xml`; override them with `camera_resolution:=` and `camera_fps:=`. Any other `body_tracking.launch.xml` argument can be passed as well.
 
-The cameras are opened by serial number. For other ZED Minis, pass `camera_serials:=` (shown by `ZED_Explorer -a`), keeping one entry per camera in `camera_names:=` and `stream_ports:=`, and update the calibration file.
+- By default this uses `BODY_18` (colliders only in `human_mapping`); pass `body_format:=BODY_38` to compute joint angles.
+- Override resolution and frame rate with `camera_resolution:=` and `camera_fps:=` (valid combinations are listed in `src/zed_launcher/launch/zed_mini.launch.xml`).
+- For different ZED Minis, pass `camera_serials:="[<serial1>, <serial2>]"` (shown by `ZED_Explorer -a`) and update the calibration file.
 
-## Calibration
-The ZED X calibration is `src/zed_launcher/calibration/zedx/calibration.json` and the ZED Mini calibration is `src/zed_launcher/calibration/zedm/calibration.json`. To calibrate the cameras, update that file with the output obtained from the [ZED360](https://www.stereolabs.com/docs/fusion/zed360) tool, then rebuild `zed_launcher`.
+### Calibration
+
+Calibration files are located at:
+- **ZED X:** `src/zed_launcher/calibration/zedx/calibration.json`
+- **ZED Mini:** `src/zed_launcher/calibration/zedm/calibration.json`
+
+To calibrate the cameras, update the corresponding file with the output from [ZED360](https://www.stereolabs.com/docs/fusion/zed360) and rebuild `zed_launcher`.
