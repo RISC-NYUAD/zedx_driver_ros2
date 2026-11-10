@@ -1,12 +1,18 @@
 # zedx_driver_ros2
 
-ROS 2 bringup and fused body tracking for ZED X and ZED Mini cameras.
+ROS 2 bringup and fused body tracking for ZED X cameras. The cameras connect to a ZED Box while primary compute runs on a networked workstation with an RTX GPU.
 
-For ZED X, the cameras connect to a ZED Box while primary compute runs on a networked workstation with an RTX GPU. USB cameras such as the ZED Mini can run directly on a single machine (see [ZED Mini](#zed-mini)).
+## Hardware Setup
+
+The system is setup and connected as shown below.
+
+<p align="center">
+  <img src="docs/hardware_setup.png" alt="setup" />
+</p>
 
 ## Installation
 
-Run the following steps on both the ZED Box and the networked workstation (or on a single machine for ZED Mini):
+Run the following steps on both the ZED Box and the networked workstation:
 
 1. Clone the repository:
    ```bash
@@ -14,7 +20,7 @@ Run the following steps on both the ZED Box and the networked workstation (or on
    ```
 
 2. Configure Zenoh (`src/RMW_ZENOH_ROUTER_CONFIG.json5`):
-   - **ZED Box (or single machine):** leave as is.
+   - **ZED Box:** leave as is.
    - **Workstation:** add the ZED Box router IP to `connect.endpoints`, e.g. `endpoints: ["tcp/192.168.0.133:7447"]`.
 
 3. In `docker/Dockerfile`, set `FROM` and `ROS_DISTRO` to match the machine:
@@ -35,8 +41,6 @@ Run the following steps on both the ZED Box and the networked workstation (or on
 ## Usage
 
 All commands below are run inside the container (`docker exec -it zedx_driver_ros2 bash`).
-
-### ZED X (ZED Box + Workstation)
 
 **On the ZED Box:**
 
@@ -70,9 +74,13 @@ All commands below are run inside the container (`docker exec -it zedx_driver_ro
 
 ![rviz](docs/rviz.png)
 
-### ZED Mini
+## Calibration
 
-Two ZED Minis plugged into the same computer do not require a stream server. Start the Zenoh router as above, then run:
+To calibrate the ZED X cameras, update `src/zed_launcher/calibration/zedx/calibration.json` with the output from [ZED360](https://www.stereolabs.com/docs/fusion/zed360) and rebuild `zed_launcher`.
+
+## ZED Mini
+
+USB ZED Mini cameras plugged directly into a single computer are also supported without a stream server. Start the Zenoh router as above, then run:
 
 ```bash
 ros2 launch zed_launcher zed_mini.launch.xml debug:=true rviz:=true
@@ -80,12 +88,4 @@ ros2 launch zed_launcher zed_mini.launch.xml debug:=true rviz:=true
 
 - By default this uses `BODY_18` (colliders only in `human_mapping`); pass `body_format:=BODY_38` to compute joint angles.
 - Override resolution and frame rate with `camera_resolution:=` and `camera_fps:=` (valid combinations are listed in `src/zed_launcher/launch/zed_mini.launch.xml`).
-- For different ZED Minis, pass `camera_serials:="[<serial1>, <serial2>]"` (shown by `ZED_Explorer -a`) and update the calibration file.
-
-### Calibration
-
-Calibration files are located at:
-- **ZED X:** `src/zed_launcher/calibration/zedx/calibration.json`
-- **ZED Mini:** `src/zed_launcher/calibration/zedm/calibration.json`
-
-To calibrate the cameras, update the corresponding file with the output from [ZED360](https://www.stereolabs.com/docs/fusion/zed360) and rebuild `zed_launcher`.
+- For different ZED Minis, pass `camera_serials:="[<serial1>, <serial2>]"` (shown by `ZED_Explorer -a`) and update `src/zed_launcher/calibration/zedm/calibration.json`.
